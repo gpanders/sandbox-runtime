@@ -2137,6 +2137,10 @@ async function wrapWithSandboxAgain(
   // Check custom config to allow pseudo-terminal (can be applied dynamically)
   const allowPty = customConfig?.allowPty ?? config?.allowPty
 
+  // Check custom config to allow .git/config access
+  const allowGitConfig =
+    customConfig?.filesystem?.allowGitConfig ?? getAllowGitConfig()
+
   const gitSafeDirectories = getGitSafeDirectories(customConfig)
 
   switch (platform) {
@@ -2158,16 +2162,21 @@ async function wrapWithSandboxAgain(
         setEnvVars: credentialRestrictions.setEnvVars,
         maskedFileBinds: credentialRestrictions.maskedFileBinds,
         degradeToDenyPaths: credentialRestrictions.degradeToDenyPaths,
-        allowUnixSockets: getAllowUnixSockets(),
+        allowUnixSockets:
+          customConfig?.network?.allowUnixSockets ?? getAllowUnixSockets(),
         allowAllUnixSockets: getAllowAllUnixSockets(),
-        allowLocalBinding: getAllowLocalBinding(),
+        allowLocalBinding:
+          customConfig?.network?.allowLocalBinding ?? getAllowLocalBinding(),
         allowMachLookup: getAllowMachLookup(),
         ignoreViolations: getIgnoreViolations(),
         allowPty,
-        allowGitConfig: getAllowGitConfig(),
+        allowGitConfig,
         gitSafeDirectories,
-        enableWeakerNetworkIsolation: getEnableWeakerNetworkIsolation(),
-        allowAppleEvents: getAllowAppleEvents(),
+        enableWeakerNetworkIsolation:
+          customConfig?.enableWeakerNetworkIsolation ??
+          getEnableWeakerNetworkIsolation(),
+        allowAppleEvents:
+          customConfig?.allowAppleEvents ?? getAllowAppleEvents(),
         binShell,
       })
 
@@ -2203,7 +2212,7 @@ async function wrapWithSandboxAgain(
         binShell,
         ripgrepConfig: getRipgrepConfig(),
         mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),
-        allowGitConfig: getAllowGitConfig(),
+        allowGitConfig,
         gitSafeDirectories,
         seccompConfig: getSeccompConfig(),
         bwrapPath: config?.bwrapPath,
