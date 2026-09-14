@@ -126,7 +126,14 @@ export async function decideAndRespond(
     // terminator; on the SigV4 path a truncated buffer would be signed).
     // The shim's own error listener covers the tee cancelling it while
     // the client is still piping.
-    const shim = new PassThrough()
+    const shim = new PassThrough({
+      destroy(error, callback) {
+        // Node's toWeb adapter can enqueue buffered data after cancellation.
+        // This private shim has no other data consumers.
+        this.removeAllListeners('data')
+        callback(error)
+      },
+    })
     shim.on('error', () => {})
     req.pipe(shim)
     const web = Readable.toWeb(shim) as ReadableStream<Uint8Array>
