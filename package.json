@@ -23,7 +23,7 @@
     "lint:check": "eslint 'src/**/*.ts' --cache --cache-location=node_modules/.cache/.eslintcache",
     "format": "prettier --write 'src/**/*.ts' --cache --log-level warn",
     "prepublishOnly": "npm run clean && npm run build",
-    "prepare": "husky"
+    "prepare": "npm run build"
   },
   "dependencies": {
     "@pondwader/socks5-server": "^1.0.10",
@@ -44,8 +44,6 @@
     "eslint-plugin-prettier": "^5.1.3",
     "fast-check": "^4.8.0",
     "globals": "^15.12.0",
-    "husky": "^9.1.7",
-    "lint-staged": "^16.2.6",
     "prettier": "3.3.3",
     "typescript": "^5.6.3",
     "typescript-eslint": "^8.13.0"
