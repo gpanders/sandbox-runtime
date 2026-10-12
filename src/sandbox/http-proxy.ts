@@ -123,6 +123,13 @@ export interface HttpProxyServerOptions {
    */
   shouldTerminateTLS?(hostname: string, port: number): boolean
 
+  /** Explicit destination exceptions also bypass TLS termination. */
+  allowOpaqueTunnel?(
+    hostname: string,
+    port: number,
+    encodedCommand?: string,
+  ): boolean
+
   /**
    * Per-request filter; runs on plain-HTTP proxy requests and on terminated
    * HTTPS requests. See request-filter.ts.
@@ -135,6 +142,9 @@ export interface HttpProxyServerOptions {
    * unchanged.
    */
   filterRequest?: FilterRequestCallback
+
+  /** Select an invocation's filter. Undefined uses filterRequest. */
+  getFilterRequest?(encodedCommand?: string): FilterRequestCallback | undefined
 
   /**
    * Called when `filterRequest` denies a request, with the verified
@@ -251,15 +261,12 @@ export interface HttpProxyServerOptions {
   stripResponseHeaders?: string[]
 
   /**
-   * When true, a CONNECT is served only by in-process TLS termination: a
-   * CONNECT whose first bytes are not a TLS ClientHello is closed, and one
-   * that would not be terminated at all (no mitmCA, or shouldTerminateTLS
-   * says no) is refused with 403, instead of either being tunnelled
-   * opaquely past filterRequest. Each refusal is reported through
-   * onFilterRequestDenied with method CONNECT. Use it when every request
-   * must be seen by filterRequest; the SOCKS side of the same port needs
-   * SocksProxyServerOptions.refuseOpaqueTunnels too. CONNECT-carried SSH
-   * (e.g. a GIT_SSH_COMMAND through this proxy) stops working.
+   * When true, require TLS termination unless allowOpaqueTunnel permits
+   * an opaque tunnel. Non-TLS bytes on a terminated CONNECT are closed.
+   * CONNECT requests outside TLS termination are refused with 403.
+   * Refusals call onFilterRequestDenied with method CONNECT.
+   * Opaque exceptions bypass filterRequest. Enable
+   * SocksProxyServerOptions.refuseOpaqueTunnels on the SOCKS side too.
    */
   refuseOpaqueTunnels?: boolean
 
@@ -682,6 +689,11 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       // canonicalization fails, so the two layers can never disagree.
       const hostname = canonicalizeHost(requestedHost) ?? requestedHost
       const lookup = options.lookupFor?.(port, auth.encodedCommand)
+      const opaqueAllowed =
+        options.allowOpaqueTunnel?.(hostname, port, auth.encodedCommand) ===
+        true
+      const filterRequest =
+        options.getFilterRequest?.(auth.encodedCommand) ?? options.filterRequest
 
       // Decide upstream route:
       //   in-process TLS termination
@@ -692,6 +704,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       // layer, so the first two never both apply.)
       if (
         options.mitmCA &&
+        !opaqueAllowed &&
         (options.shouldTerminateTLS?.(hostname, port) ?? true)
       ) {
         // We can only terminate TLS. CONNECT also carries non-TLS streams —
@@ -751,7 +764,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
           disarmDecisionWindowEof()
           terminateAndForward(
             options.mitmCA,
-            options.filterRequest,
+            filterRequest,
             options.mutateHeaders,
             options.getBodySubstitutions,
             socket,
@@ -787,7 +800,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
           )
           return
         }
-        if (options.refuseOpaqueTunnels) {
+        if (options.refuseOpaqueTunnels && !opaqueAllowed) {
           logForDebugging(
             `[tls-terminate] non-TLS bytes on CONNECT ${hostname}:${port}; refused (refuseOpaqueTunnels)`,
           )
@@ -804,7 +817,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
           `[tls-terminate] non-TLS bytes on CONNECT ${hostname}:${port}; opaque-tunnelling`,
         )
         head = peeked.head
-      } else if (options.refuseOpaqueTunnels) {
+      } else if (options.refuseOpaqueTunnels && !opaqueAllowed) {
         const reason = 'this proxy does not tunnel CONNECTs it cannot inspect'
         options.onFilterRequestDenied?.({
           method: 'CONNECT',
@@ -999,6 +1012,8 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       // leaves behind is the trailing dot, which is exactly the spelling
       // that used to reach getMitmSocketPath / the upstream unchanged.
       const hostname = canonicalizeHost(requestedHost) ?? requestedHost
+      const filterRequest =
+        options.getFilterRequest?.(auth.encodedCommand) ?? options.filterRequest
       // The authority we forward (request-target and Host header) is rebuilt
       // from the canonical host so the MITM / parent proxy sees the host we
       // allowlist-checked, not the client's spelling of it.
@@ -1031,7 +1046,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       // client spelled it, hook or no hook.
       const requestTarget = options.requestTargetAsSpelled
         ? requestTargetAsSpelled(req.url!, { absolute: true })
-        : options.filterRequest
+        : filterRequest
           ? normalizeRequestTarget(req.url!, req.method)
           : `${url.pathname}${url.search}`
       if (requestTarget === undefined) {
@@ -1089,11 +1104,11 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
           return
         }
       }
-      if (options.filterRequest) {
+      if (filterRequest) {
         const ac = new AbortController()
         res.once('close', () => ac.abort())
         const out = await decideAndRespond(
-          options.filterRequest,
+          filterRequest,
           req,
           res,
           absUrl,

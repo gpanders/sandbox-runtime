@@ -115,7 +115,10 @@ import {
   sanitizeUnregisteredCommandKey,
   shouldIgnoreViolation,
 } from './sandbox-violation-store.js'
-import type { MutateForwardedHeaders } from './request-filter.js'
+import type {
+  FilterRequestCallback,
+  MutateForwardedHeaders,
+} from './request-filter.js'
 import type { GetBodySubstitutions } from './body-substitution.js'
 import {
   canonicalizeHost,
@@ -286,18 +289,28 @@ export function resolveCommandText(decodedKey: string): string {
  */
 const MIN_NETWORK_LISTS_COMMAND_ID_LENGTH = 22
 
-/**
- * Attribution key to the network allow list registered for one invocation
- * (registerCommandNetworkLists), keyed the way commandTextsByKey is because
- * the proxy username delivers both. The embedder removes an entry when its
- * command is gone. Not bounded the way commandTextsByKey is: dropping the
- * oldest entry would silently take a list away from a running command.
- */
-const commandNetworkListsByKey = new Map<string, { allowedDomains: string[] }>()
+export interface CommandNetworkLists {
+  allowedDomains?: string[]
+  /** Destinations whose tunnels bypass TLS termination and request filtering. */
+  opaqueTunnelDomains?: string[]
+  /** Replaces the global request filter for this invocation. */
+  filterRequest?: FilterRequestCallback
+}
+
+// Eviction would silently remove permissions from a running command.
+const commandNetworkListsByKey = new Map<string, CommandNetworkLists>()
+
+function networkListsForCommand(
+  encodedCommand?: string,
+): CommandNetworkLists | undefined {
+  return encodedCommand
+    ? commandNetworkListsByKey.get(decodeSandboxedCommand(encodedCommand))
+    : undefined
+}
 
 function registerCommandNetworkLists(
   commandId: string,
-  lists: { allowedDomains?: string[] },
+  lists: CommandNetworkLists,
 ): void {
   // The floor is measured on the key the map holds, not on the raw id, and
   // less U+FFFD: every unpaired surrogate becomes one, so it carries nothing.
@@ -318,25 +331,39 @@ function registerCommandNetworkLists(
         `never derived from the command text, a counter or the time.`,
     )
   }
-  const allowedDomains = lists?.allowedDomains ?? []
-  if (!Array.isArray(allowedDomains)) {
-    throw new Error(
-      'registerCommandNetworkLists: allowedDomains must be an array of strings.',
-    )
-  }
-  for (const entry of allowedDomains) {
-    if (typeof entry !== 'string' || !isValidAllowedDomainEntry(entry)) {
+  for (const field of ['allowedDomains', 'opaqueTunnelDomains'] as const) {
+    const entries = lists?.[field]
+    if (entries === undefined) {
+      continue
+    }
+    if (!Array.isArray(entries)) {
       throw new Error(
-        `registerCommandNetworkLists: invalid allowedDomains entry ` +
-          `${JSON.stringify(entry)}. ${ALLOWED_DOMAIN_ENTRY_MESSAGE}`,
+        `registerCommandNetworkLists: ${field} must be an array of strings.`,
       )
     }
+    for (const entry of entries) {
+      if (typeof entry !== 'string' || !isValidAllowedDomainEntry(entry)) {
+        throw new Error(
+          `registerCommandNetworkLists: invalid ${field} entry ` +
+            `${JSON.stringify(entry)}. ${ALLOWED_DOMAIN_ENTRY_MESSAGE}`,
+        )
+      }
+    }
   }
-  commandNetworkListsByKey.set(
-    key,
-    // Copied, so the caller cannot change what was validated.
-    { allowedDomains: [...allowedDomains] },
-  )
+  if (
+    lists?.filterRequest !== undefined &&
+    typeof lists.filterRequest !== 'function'
+  ) {
+    throw new Error(
+      'registerCommandNetworkLists: filterRequest must be a function.',
+    )
+  }
+  // Copy the lists so the caller cannot change validated destinations.
+  commandNetworkListsByKey.set(key, {
+    allowedDomains: [...(lists?.allowedDomains ?? [])],
+    opaqueTunnelDomains: [...(lists?.opaqueTunnelDomains ?? [])],
+    filterRequest: lists?.filterRequest,
+  })
   // An external HTTP proxy is handed no username, so no connection names an id.
   if (config?.network.httpProxyPort !== undefined) {
     logForDebugging(
@@ -522,9 +549,7 @@ async function filterNetworkRequest(
   // Coming after both configured lists, it lifts the default deny for that
   // one command and never a configured deniedDomains entry. The username is
   // presented by the sandboxed client: see registerCommandNetworkLists.
-  const perCommand = encodedCommand
-    ? commandNetworkListsByKey.get(decodeSandboxedCommand(encodedCommand))
-    : undefined
+  const perCommand = networkListsForCommand(encodedCommand)
   for (const allowedDomain of perCommand?.allowedDomains ?? []) {
     if (matchesDomainPatternWithPort(canonicalHost, port, allowedDomain)) {
       logForDebugging(`Allowed by per-command rule: ${host}:${port}`)
@@ -699,13 +724,24 @@ async function startMuxProxyServer(
 ): Promise<number> {
   const injectCredentials = buildCredentialInjector()
   const injectBodyCredentials = buildBodyCredentialInjector()
+  const allowOpaqueTunnel = (
+    host: string,
+    port: number,
+    encodedCommand?: string,
+  ) =>
+    networkListsForCommand(encodedCommand)?.opaqueTunnelDomains?.some(pattern =>
+      matchesDomainPatternWithPort(host, port, pattern),
+    ) ?? false
   httpProxyServer = createHttpProxyServer({
     filter: (port, host, _socket, encodedCommand) =>
       filterNetworkRequest(port, host, sandboxAskCallback, encodedCommand),
     getMitmSocketPath,
     mitmCA,
     shouldTerminateTLS: shouldTerminateTLSForHost,
+    allowOpaqueTunnel,
     filterRequest: config?.network.filterRequest,
+    getFilterRequest: encodedCommand =>
+      networkListsForCommand(encodedCommand)?.filterRequest,
     plaintextHeaderSet: config?.network.allowPlaintextHeaderSet,
     stripResponseHeaders: config?.network.stripResponseHeaders,
     refuseOpaqueTunnels: config?.network.refuseOpaqueTunnels,
@@ -743,9 +779,9 @@ async function startMuxProxyServer(
     parentProxy,
     lookupFor: directLookup,
     proxyAuthToken,
-    // A SOCKS tunnel is opaque, so the option that keeps opaque CONNECT
-    // tunnels off the HTTP side must close this side of the port too.
+    // A SOCKS tunnel is opaque, so both proxies use the same exceptions.
     refuseOpaqueTunnels: config?.network.refuseOpaqueTunnels,
+    allowOpaqueTunnel,
     onTunnelRefused: (port, host, encodedCommand) => {
       recordProxyViolation(
         `deny socks-tunnel ${host}:${port} (refuseOpaqueTunnels)`,
@@ -2861,16 +2897,21 @@ export interface ISandboxManager {
    * Register the network allow list of one invocation, under the `commandId`
    * its wrap was given ({@link WrapWithSandboxOptions}). Entries are matched
    * and validated as `network.allowedDomains` entries are; an invalid one
-   * throws. Registering an id again replaces its list.
+   * throws. Registering an id again replaces its policy.
    *
-   * Order of evaluation for a connection: a configured `deniedDomains` match
-   * denies; a configured `allowedDomains` match allows;
-   * `network.strictAllowlist` denies; a match in the list registered for the
-   * id the connection presents allows; then the ask callback decides if
-   * there is one, and otherwise the connection is denied. So a per-command
-   * entry never overrides a configured `deniedDomains` entry and is ignored
-   * entirely under `strictAllowlist`. It also never enters `network.*`, so
-   * the default `injectHosts` scope of a masked credential does not grow.
+   * `opaqueTunnelDomains` skips TLS termination and permits opaque HTTP
+   * and SOCKS tunnels to matching destinations, even when
+   * `refuseOpaqueTunnels` is true. Destination allow/deny rules still apply.
+   * `filterRequest` replaces the global request filter for this invocation
+   * on plain HTTP and terminated HTTPS. Opaque tunnels do not use it.
+   *
+   * Destination evaluation: a configured `deniedDomains` match denies;
+   * a configured `allowedDomains` match allows; `network.strictAllowlist`
+   * denies; a match in the invocation's registered `allowedDomains` allows;
+   * then the ask callback decides, or the connection is denied.
+   * Supplemental `allowedDomains` entries never override configured denies
+   * and are ignored under `strictAllowlist`. They never enter `network.*`,
+   * so the default `injectHosts` scope of a masked credential does not grow.
    *
    * The proxy reads the id from the proxy username, which the sandboxed
    * client presents, so the id is the ONLY thing binding a connection to an
@@ -2896,11 +2937,12 @@ export interface ISandboxManager {
    */
   registerCommandNetworkLists(
     commandId: string,
-    lists: { allowedDomains?: string[] },
+    lists: CommandNetworkLists,
   ): void
   /**
-   * Remove the list registered for `commandId`. A no-op for an id that has
-   * none. `reset()` removes them all.
+   * Remove the policy registered for `commandId`. A no-op for an id that has
+   * none. Existing CONNECT tunnels keep their selected policy.
+   * `reset()` removes all policies.
    */
   unregisterCommandNetworkLists(commandId: string): void
   /**

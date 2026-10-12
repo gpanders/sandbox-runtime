@@ -7,6 +7,10 @@ import {
 } from '../../src/index.js'
 import { connect, createServer, type AddressInfo, type Server } from 'net'
 import { randomBytes } from 'node:crypto'
+import { connect as tlsConnect } from 'node:tls'
+import { createServer as createHttpsServer } from 'node:https'
+import { mintLeafCert } from '../../src/sandbox/mitm-leaf.js'
+import { testWithTls } from '../helpers/emitted-connections.js'
 import { getPlatform } from '../../src/utils/platform.js'
 import {
   encodeSandboxedCommand,
@@ -432,6 +436,72 @@ function connectAs(
   })
 }
 
+function requestAs(
+  proxyPort: number,
+  target: string,
+  username: string,
+  transport: 'http' | 'https' | 'opaque' = 'http',
+  upgrade = false,
+): Promise<string> {
+  return new Promise(resolve => {
+    const auth = Buffer.from(
+      `${username}:${SandboxManager.getProxyAuthToken()}`,
+    ).toString('base64')
+    let response = ''
+    const socket = connect(proxyPort, '127.0.0.1', () => {
+      socket.write(
+        transport === 'http'
+          ? request(`http://${target}/x/../command?key=1`)
+          : `CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n` +
+              `Proxy-Authorization: Basic ${auth}\r\n\r\n`,
+      )
+    })
+    const finish = () => {
+      socket.destroy()
+      resolve(response)
+    }
+    const request = (path: string) =>
+      `${upgrade ? 'GET' : 'POST'} ${path} HTTP/1.1\r\nHost: ${target}\r\n` +
+      (transport === 'http' ? `Proxy-Authorization: Basic ${auth}\r\n` : '') +
+      (upgrade
+        ? `Connection: Upgrade\r\nUpgrade: websocket\r\n` +
+          `Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n`
+        : `Content-Length: 0\r\nConnection: close\r\n\r\n`)
+    socket.setTimeout(2000, finish)
+    socket.on('error', finish)
+    socket.on('close', finish)
+    let head = ''
+    socket.on('data', function receive(chunk: Buffer) {
+      if (transport === 'http') {
+        response += chunk.toString()
+        return
+      }
+      head += chunk.toString()
+      if (!head.includes('\r\n\r\n')) return
+      socket.off('data', receive)
+      if (!head.startsWith('HTTP/1.1 200')) {
+        response = head
+        finish()
+        return
+      }
+      const stream =
+        transport === 'https'
+          ? tlsConnect({
+              socket,
+              ca: SandboxManager.getMitmCA()!.certPem,
+              checkServerIdentity: () => undefined,
+            })
+          : socket
+      stream.on('data', data => (response += data.toString()))
+      stream.on('error', finish)
+      stream.on('close', finish)
+      const send = () => stream.write(request('/x/../command?key=1'))
+      if (transport === 'https') stream.once('secureConnect', send)
+      else send()
+    })
+  })
+}
+
 /**
  * The same over SOCKS5: the reply code to a CONNECT for `target` under
  * `username` (0 is granted, 2 is refused by the rules).
@@ -537,6 +607,276 @@ describe('per-command network allow lists', () => {
   afterEach(async () => {
     await SandboxManager.reset()
     loopback.server.close()
+  })
+
+  it('scopes opaque exceptions to an id, host and port on HTTP and SOCKS', async () => {
+    const network = {
+      allowedDomains: ['127.0.0.1', '127.0.0.2'],
+      refuseOpaqueTunnels: true,
+    }
+    const port = await start(network)
+    const socksPort = SandboxManager.getSocksProxyPort()!
+    const id = randomCommandId()
+    const exceptions = [loopback.target]
+    SandboxManager.registerCommandNetworkLists(id, {
+      opaqueTunnelDomains: exceptions,
+    })
+    exceptions.length = 0
+    expect(await connectAs(port, loopback.target, usernameFor(id))).toBe(200)
+    expect(
+      await socksConnectAs(socksPort, loopback.target, usernameFor(id)),
+    ).toBe(0)
+    for (const username of ['srt', usernameFor(randomCommandId())]) {
+      expect(await connectAs(port, loopback.target, username)).toBe(403)
+      expect(await socksConnectAs(socksPort, loopback.target, username)).toBe(1)
+    }
+    const [, listeningPort] = loopback.target.split(':')
+    const otherPort =
+      Number(listeningPort) === 65535 ? 65534 : Number(listeningPort) + 1
+    for (const target of [
+      `127.0.0.2:${listeningPort}`,
+      `127.0.0.1:${otherPort}`,
+    ]) {
+      expect(await connectAs(port, target, usernameFor(id))).toBe(403)
+      expect(await socksConnectAs(socksPort, target, usernameFor(id))).toBe(1)
+    }
+    SandboxManager.unregisterCommandNetworkLists(id)
+    expect(await connectAs(port, loopback.target, usernameFor(id))).toBe(403)
+    SandboxManager.registerCommandNetworkLists(id, {
+      opaqueTunnelDomains: [loopback.target],
+    })
+    await SandboxManager.reset()
+    const resetPort = await start(network)
+    expect(await connectAs(resetPort, loopback.target, usernameFor(id))).toBe(
+      403,
+    )
+  })
+
+  it.each(['deny list', 'allow list'])(
+    'opaque exceptions preserve the %s',
+    async kind => {
+      const port = await start({
+        allowedDomains: kind === 'deny list' ? [loopback.target] : [],
+        deniedDomains: kind === 'deny list' ? ['127.0.0.1'] : [],
+        refuseOpaqueTunnels: true,
+      })
+      const id = randomCommandId()
+      SandboxManager.registerCommandNetworkLists(id, {
+        opaqueTunnelDomains: [loopback.target],
+      })
+      expect(await connectAs(port, loopback.target, usernameFor(id))).toBe(403)
+      expect(
+        await socksConnectAs(
+          SandboxManager.getSocksProxyPort()!,
+          loopback.target,
+          usernameFor(id),
+        ),
+      ).toBe(2)
+    },
+  )
+
+  testWithTls(
+    'opaque exceptions bypass TLS termination and request filtering',
+    async () => {
+      const port = await start({
+        allowedDomains: [loopback.target],
+        refuseOpaqueTunnels: true,
+        tlsTerminate: {},
+        filterRequest: async () => ({ action: 'deny' }),
+      })
+      const id = randomCommandId()
+      SandboxManager.registerCommandNetworkLists(id, {
+        opaqueTunnelDomains: [loopback.target],
+      })
+      expect(
+        await requestAs(port, loopback.target, usernameFor(id), 'opaque'),
+      ).toEndWith('ok')
+      expect(
+        await requestAs(
+          port,
+          loopback.target,
+          usernameFor(randomCommandId()),
+          'opaque',
+        ),
+      ).not.toEndWith('ok')
+    },
+  )
+
+  testWithTls(
+    'carries a TLS WebSocket upgrade only for an opaque exception',
+    async () => {
+      const port = await start({
+        allowedDomains: ['127.0.0.1'],
+        refuseOpaqueTunnels: true,
+        tlsTerminate: {},
+      })
+      const leaf = mintLeafCert(SandboxManager.getMitmCA()!, '127.0.0.1')
+      const upstream = createHttpsServer({
+        cert: leaf.certPem,
+        key: leaf.keyPem,
+      })
+      const headers: Array<string | undefined> = []
+      upstream.on('upgrade', (request, socket) => {
+        headers.push(request.headers['proxy-authorization'])
+        socket.end(
+          Buffer.concat([
+            Buffer.from(
+              'HTTP/1.1 101 Switching Protocols\r\n' +
+                'Connection: Upgrade\r\nUpgrade: websocket\r\n' +
+                'Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n',
+            ),
+            Buffer.from([0x81, 8]),
+            Buffer.from('ws-ready'),
+          ]),
+        )
+      })
+      await new Promise<void>(resolve =>
+        upstream.listen(0, '127.0.0.1', resolve),
+      )
+      try {
+        const target = `127.0.0.1:${(upstream.address() as AddressInfo).port}`
+        const id = randomCommandId()
+        SandboxManager.registerCommandNetworkLists(id, {
+          opaqueTunnelDomains: [target],
+        })
+        const response = await requestAs(
+          port,
+          target,
+          usernameFor(id),
+          'https',
+          true,
+        )
+        expect(response).toStartWith('HTTP/1.1 101')
+        expect(response).toEndWith('ws-ready')
+        expect(
+          await requestAs(
+            port,
+            target,
+            usernameFor(randomCommandId()),
+            'https',
+            true,
+          ),
+        ).not.toEndWith('ws-ready')
+        expect(headers).toEqual([undefined])
+      } finally {
+        await new Promise<void>(resolve => upstream.close(() => resolve()))
+      }
+    },
+  )
+
+  it('replaces the global request filter only for its registered id', async () => {
+    const network = {
+      allowedDomains: [loopback.target],
+      filterRequest: async () => ({ action: 'deny' as const }),
+    }
+    const port = await start(network)
+    const allowed = randomCommandId()
+    const denied = randomCommandId()
+    SandboxManager.registerCommandNetworkLists(allowed, {
+      filterRequest: async () => ({ action: 'allow' }),
+    })
+    SandboxManager.registerCommandNetworkLists(denied, {
+      filterRequest: async () => ({ action: 'deny', status: 451 }),
+    })
+    const responses = await Promise.all(
+      [
+        usernameFor(allowed),
+        usernameFor(denied),
+        usernameFor(randomCommandId()),
+        'srt',
+      ].map(username => requestAs(port, loopback.target, username)),
+    )
+    expect(responses.map(response => Number(response.split(' ')[1]))).toEqual([
+      200, 451, 403, 403,
+    ])
+    SandboxManager.unregisterCommandNetworkLists(allowed)
+    expect(
+      await requestAs(port, loopback.target, usernameFor(allowed)),
+    ).toStartWith('HTTP/1.1 403')
+    SandboxManager.registerCommandNetworkLists(allowed, {
+      filterRequest: async () => ({ action: 'allow' }),
+    })
+    await SandboxManager.reset()
+    const resetPort = await start(network)
+    expect(
+      await requestAs(resetPort, loopback.target, usernameFor(allowed)),
+    ).toStartWith('HTTP/1.1 403')
+  })
+
+  testWithTls(
+    'selects the registered filter for terminated HTTPS',
+    async () => {
+      const port = await start({
+        allowedDomains: [loopback.target],
+        tlsTerminate: {},
+        filterRequest: async () => ({ action: 'deny' }),
+      })
+      const id = randomCommandId()
+      SandboxManager.registerCommandNetworkLists(id, {
+        filterRequest: async () => ({ action: 'deny', status: 451 }),
+      })
+      expect(
+        await requestAs(port, loopback.target, usernameFor(id), 'https'),
+      ).toStartWith('HTTP/1.1 451')
+      expect(
+        await requestAs(
+          port,
+          loopback.target,
+          usernameFor(randomCommandId()),
+          'https',
+        ),
+      ).toStartWith('HTTP/1.1 403')
+    },
+  )
+
+  testWithTls(
+    'normalizes HTTPS targets when only the invocation has a filter',
+    async () => {
+      const port = await start({
+        allowedDomains: [loopback.target],
+        tlsTerminate: {},
+      })
+      const id = randomCommandId()
+      let requestTarget: string | undefined
+      SandboxManager.registerCommandNetworkLists(id, {
+        filterRequest: async (_request, info) => {
+          requestTarget = info?.requestTarget
+          return { action: 'deny', status: 451 }
+        },
+      })
+      expect(
+        await requestAs(port, loopback.target, usernameFor(id), 'https'),
+      ).toStartWith('HTTP/1.1 451')
+      expect(requestTarget).toBe('/command?key=1')
+    },
+  )
+
+  it('rejects malformed policy fields without replacing a registered policy', async () => {
+    const port = await start({
+      allowedDomains: [loopback.target],
+      refuseOpaqueTunnels: true,
+    })
+    const id = randomCommandId()
+    SandboxManager.registerCommandNetworkLists(id, {
+      opaqueTunnelDomains: [loopback.target],
+    })
+    for (const value of [null, 'example.com', [443], ['*.com']]) {
+      expect(() =>
+        SandboxManager.registerCommandNetworkLists(id, {
+          opaqueTunnelDomains: value as unknown as string[],
+        }),
+      ).toThrow(/opaqueTunnelDomains/)
+    }
+    for (const value of [null, false, 'allow']) {
+      expect(() =>
+        SandboxManager.registerCommandNetworkLists(id, {
+          filterRequest: value as unknown as NonNullable<
+            SandboxRuntimeConfig['network']['filterRequest']
+          >,
+        }),
+      ).toThrow(/filterRequest must be a function/)
+    }
+    expect(await connectAs(port, loopback.target, usernameFor(id))).toBe(200)
   })
 
   it('lifts the default deny for the id the connection presents, and for no other', async () => {

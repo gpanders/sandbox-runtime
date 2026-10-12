@@ -66,13 +66,20 @@ export interface SocksProxyServerOptions {
   ): Promise<{ deniedReason?: string }>
 
   /**
-   * When true, every SOCKS CONNECT is refused at the handshake with
-   * "general SOCKS server failure", before the allowlist is consulted and
-   * before anything is dialled. A SOCKS tunnel is opaque, so nothing sent
+   * When true, refuse SOCKS CONNECT unless allowOpaqueTunnel permits it.
+   * Refusal answers "general SOCKS server failure" before the allowlist is
+   * consulted or anything is dialled. A SOCKS tunnel is opaque, so nothing sent
    * through it could pass the HTTP proxy's filterRequest. Set it together
    * with HttpProxyServerOptions.refuseOpaqueTunnels.
    */
   refuseOpaqueTunnels?: boolean
+
+  /** Explicit destination exceptions to opaque refusal. */
+  allowOpaqueTunnel?(
+    hostname: string,
+    port: number,
+    encodedCommand?: string,
+  ): boolean
 
   /** Called for each CONNECT refused under refuseOpaqueTunnels. */
   onTunnelRefused?(port: number, host: string, encodedCommand?: string): void
@@ -116,21 +123,37 @@ export function createSocksProxyServer(
   }
 
   socksServer.setRulesetValidator(conn => {
-    if (options.refuseOpaqueTunnels) {
-      logForDebugging(
-        `SOCKS CONNECT to ${JSON.stringify(conn.destAddress)}:${conn.destPort} refused (refuseOpaqueTunnels)`,
-      )
-      options.onTunnelRefused?.(
-        conn.destPort,
-        conn.destAddress,
-        encodedCommandFromProxyUser(conn.username),
-      )
-      // Answered here rather than through the library's deny, whose reply
-      // claims a ruleset refusal of this destination.
-      conn.socket.end(SOCKS_REPLY_GENERAL_FAILURE, () => conn.socket.destroy())
-      return undefined
+    try {
+      const host = conn.destAddress
+      const opaqueAllowed =
+        !options.refuseOpaqueTunnels ||
+        (isValidHost(host) &&
+          options.allowOpaqueTunnel?.(
+            canonicalizeHost(host) ?? host,
+            conn.destPort,
+            encodedCommandFromProxyUser(conn.username),
+          ) === true)
+      if (options.refuseOpaqueTunnels && !opaqueAllowed) {
+        logForDebugging(
+          `SOCKS CONNECT to ${JSON.stringify(host)}:${conn.destPort} refused (refuseOpaqueTunnels)`,
+        )
+        options.onTunnelRefused?.(
+          conn.destPort,
+          host,
+          encodedCommandFromProxyUser(conn.username),
+        )
+        conn.socket.end(SOCKS_REPLY_GENERAL_FAILURE, () =>
+          conn.socket.destroy(),
+        )
+        return undefined
+      }
+      return validateDestination(conn)
+    } catch (error) {
+      logForDebugging(`Error checking opaque tunnel policy: ${error}`, {
+        level: 'error',
+      })
+      return false
     }
-    return validateDestination(conn)
   })
 
   async function validateDestination(
