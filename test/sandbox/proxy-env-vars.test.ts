@@ -10,6 +10,7 @@ import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { spawnAsync } from '../helpers/spawn.js'
 import { isLinux, isMacOS } from '../helpers/platform.js'
+import { whichSync } from '../../src/utils/which.js'
 
 describe('generateProxyEnvVars', () => {
   it('sets CLOUDSDK_PROXY_TYPE to http (gcloud rejects "https")', () => {
@@ -23,6 +24,21 @@ describe('generateProxyEnvVars', () => {
     expect(env).toContain('CLOUDSDK_PROXY_PORT=3128')
     expect(env).not.toContain('CLOUDSDK_PROXY_TYPE=https')
   })
+
+  it.if(isMacOS && whichSync('socat') !== null)(
+    'routes macOS git-over-ssh through authenticated socat',
+    () => {
+      const gitSsh = (token?: string) =>
+        generateProxyEnvVars(3128, 1080, undefined, token, false, 'abc').find(
+          v => v.startsWith('GIT_SSH_COMMAND='),
+        )
+
+      expect(gitSsh('secret')).toContain(
+        `ProxyCommand='${whichSync('socat')} - PROXY:127.0.0.1:%h:%p,proxyport=3128,proxyauth=srt.abc:secret'`,
+      )
+      expect(gitSsh()).toContain("ProxyCommand='nc -X 5 -x localhost:1080")
+    },
+  )
 
   it('omits CLOUDSDK_PROXY_* when no HTTP proxy port is configured', () => {
     const env = generateProxyEnvVars(undefined, 1080)

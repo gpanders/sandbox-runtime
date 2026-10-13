@@ -3,6 +3,7 @@ import * as path from 'path'
 import * as fs from 'fs'
 import { getPlatform } from '../utils/platform.js'
 import { logForDebugging } from '../utils/debug.js'
+import { whichSync } from '../utils/which.js'
 import type { FilesystemPathEntry } from './sandbox-config.js'
 
 /**
@@ -720,6 +721,15 @@ export const CA_TRUST_VARS = [
   'NIX_SSL_CERT_FILE',
 ] as const
 
+// Looked up once: this runs for every sandboxed command.
+let cachedMacosSocatPath: string | null | undefined
+function macosSocatPath(): string | null {
+  if (cachedMacosSocatPath === undefined) {
+    cachedMacosSocatPath = whichSync('socat')
+  }
+  return cachedMacosSocatPath
+}
+
 export function generateProxyEnvVars(
   httpProxyPort?: number,
   socksProxyPort?: number,
@@ -843,10 +853,24 @@ export function generateProxyEnvVars(
     // configured ControlPath.
     const sshMuxOverride = '-o ControlMaster=no -o ControlPath=none'
     const platform = getPlatform()
-    if (platform === 'macos') {
+    const socatAuth = proxyAuthToken
+      ? `,proxyauth=${userRaw}:${proxyAuthToken}`
+      : ''
+    const macosSocat =
+      platform === 'macos' && proxyAuthToken && httpProxyPort
+        ? macosSocatPath()
+        : null
+    if (macosSocat) {
+      // macOS with an authenticated proxy: BSD nc has no SOCKS5 auth, so use
+      // socat HTTP CONNECT, which sends the credential. 127.0.0.1 skips a
+      // localhost lookup that the sandbox denies.
+      envVars.push(
+        `GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand='${macosSocat} - PROXY:127.0.0.1:%h:%p,proxyport=${httpProxyPort}${socatAuth}'`,
+      )
+    } else if (platform === 'macos') {
       // macOS: use BSD nc SOCKS5 proxy support (-X 5 -x). nc has no SOCKS5
       // auth, so when proxyAuthToken is set, git-over-ssh fails at the SOCKS
-      // handshake — use git-over-https (HTTP_PROXY carries the credential).
+      // handshake — install socat or use git-over-https.
       envVars.push(
         `GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand='nc -X 5 -x localhost:${socksProxyPort} %h %p'`,
       )
@@ -854,9 +878,6 @@ export function generateProxyEnvVars(
       // Linux: use socat HTTP CONNECT via the HTTP proxy bridge.
       // socat is already a required Linux sandbox dependency, and PROXY: is
       // portable across all socat versions (unlike SOCKS5-CONNECT which needs >= 1.8.0).
-      const socatAuth = proxyAuthToken
-        ? `,proxyauth=${userRaw}:${proxyAuthToken}`
-        : ''
       envVars.push(
         `GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand='socat - PROXY:localhost:%h:%p,proxyport=${httpProxyPort}${socatAuth}'`,
       )
