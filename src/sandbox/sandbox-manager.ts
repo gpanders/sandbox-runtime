@@ -2213,6 +2213,8 @@ async function wrapWithSandboxAgain(
           getEnableWeakerNetworkIsolation(),
         allowAppleEvents:
           customConfig?.allowAppleEvents ?? getAllowAppleEvents(),
+        allowSysctlRead:
+          customConfig?.allowSysctlRead ?? config?.allowSysctlRead,
         binShell,
       })
 

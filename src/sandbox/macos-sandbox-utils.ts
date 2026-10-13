@@ -25,7 +25,10 @@ import type {
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
 } from './sandbox-schemas.js'
-import type { IgnoreViolationsConfig } from './sandbox-config.js'
+import {
+  SandboxRuntimeConfigSchema,
+  type IgnoreViolationsConfig,
+} from './sandbox-config.js'
 
 export interface MacOSSandboxParams {
   command: string
@@ -80,6 +83,7 @@ export interface MacOSSandboxParams {
   gitSafeDirectories?: readonly string[]
   enableWeakerNetworkIsolation?: boolean
   allowAppleEvents?: boolean
+  allowSysctlRead?: string[]
   binShell?: string
 }
 
@@ -993,6 +997,7 @@ function generateSandboxProfile({
   allowGitConfig = false,
   enableWeakerNetworkIsolation = false,
   allowAppleEvents = false,
+  allowSysctlRead,
   logTag,
 }: {
   readConfig: FsReadRestrictionConfig | undefined
@@ -1010,8 +1015,13 @@ function generateSandboxProfile({
   allowGitConfig?: boolean
   enableWeakerNetworkIsolation?: boolean
   allowAppleEvents?: boolean
+  allowSysctlRead?: string[]
   logTag: string
 }): string {
+  const extraSysctls =
+    SandboxRuntimeConfigSchema.innerType().shape.allowSysctlRead.parse(
+      allowSysctlRead,
+    ) ?? []
   const profile: string[] = [
     '(version 1)',
     `(deny default (with message "${logTag}"))`,
@@ -1098,6 +1108,7 @@ function generateSandboxProfile({
     '',
     '; sysctl - specific sysctls only',
     '(allow sysctl-read',
+    ...Array.from(new Set(extraSysctls), name => `  (sysctl-name "${name}")`),
     '  (sysctl-name "hw.activecpu")',
     '  (sysctl-name "hw.busfrequency_compat")',
     '  (sysctl-name "hw.byteorder")',
@@ -1375,6 +1386,7 @@ export function wrapCommandWithSandboxMacOS(
     gitSafeDirectories,
     enableWeakerNetworkIsolation = false,
     allowAppleEvents = false,
+    allowSysctlRead,
     binShell,
   } = params
 
@@ -1444,6 +1456,7 @@ export function wrapCommandWithSandboxMacOS(
     allowGitConfig,
     enableWeakerNetworkIsolation,
     allowAppleEvents,
+    allowSysctlRead,
     logTag,
   })
 

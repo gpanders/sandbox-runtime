@@ -1184,6 +1184,18 @@ export const SandboxRuntimeConfigSchema = z
           'network restrictions), and can script running apps subject to TCC automation consent. ' +
           'Default: false.',
       ),
+    allowSysctlRead: z
+      .array(
+        z
+          .string()
+          .min(1)
+          .refine(
+            name => !/[^A-Za-z0-9_.-]/.test(name),
+            'Expected an exact sysctl name',
+          ),
+      )
+      .optional()
+      .describe('Additional exact sysctl names to allow reading (macOS only)'),
     ripgrep: RipgrepConfigSchema.optional().describe(
       'Custom ripgrep configuration (default: { command: "rg" })',
     ),
