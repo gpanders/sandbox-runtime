@@ -84,7 +84,9 @@ export interface MacOSSandboxParams {
   enableWeakerNetworkIsolation?: boolean
   allowAppleEvents?: boolean
   allowSysctlRead?: string[]
+  allowUnsandboxedExec?: string[]
   binShell?: string
+  profileLogTagParam?: string
 }
 
 /**
@@ -998,6 +1000,7 @@ function generateSandboxProfile({
   enableWeakerNetworkIsolation = false,
   allowAppleEvents = false,
   allowSysctlRead,
+  allowUnsandboxedExec = [],
   logTag,
 }: {
   readConfig: FsReadRestrictionConfig | undefined
@@ -1016,6 +1019,7 @@ function generateSandboxProfile({
   enableWeakerNetworkIsolation?: boolean
   allowAppleEvents?: boolean
   allowSysctlRead?: string[]
+  allowUnsandboxedExec?: string[]
   logTag: string
 }): string {
   const extraSysctls =
@@ -1031,9 +1035,17 @@ function generateSandboxProfile({
     '; Essential permissions - based on Chrome sandbox policy',
     '; Process permissions',
     '(allow process-exec)',
+    ...allowUnsandboxedExec.map(
+      path =>
+        `(allow process-exec (with no-sandbox) (subpath ${escapePath(path)}))`,
+    ),
     '(allow process-fork)',
     '(allow process-info* (target same-sandbox))',
     '(allow signal (target same-sandbox))',
+    // Unsandboxed children are outside the same-sandbox target.
+    ...(allowUnsandboxedExec.length > 0
+      ? ['(allow signal (target children))']
+      : []),
     '(allow mach-priv-task-port (target same-sandbox))',
     '',
     '; User preferences',
@@ -1387,7 +1399,9 @@ export function wrapCommandWithSandboxMacOS(
     enableWeakerNetworkIsolation = false,
     allowAppleEvents = false,
     allowSysctlRead,
+    allowUnsandboxedExec,
     binShell,
+    profileLogTagParam,
   } = params
 
   // SBPL cannot redirect a read to different bytes, so whole-file masking
@@ -1432,6 +1446,9 @@ export function wrapCommandWithSandboxMacOS(
     !hasEnvRestrictions &&
     !hasGitConfig
   ) {
+    if (profileLogTagParam !== undefined) {
+      throw new Error('profileLogTagParam requires a restriction')
+    }
     return command
   }
 
@@ -1457,8 +1474,16 @@ export function wrapCommandWithSandboxMacOS(
     enableWeakerNetworkIsolation,
     allowAppleEvents,
     allowSysctlRead,
+    allowUnsandboxedExec,
     logTag,
   })
+  if (profileLogTagParam !== undefined) {
+    return profile
+      .split(escapePath(logTag))
+      .join(
+        `(string-append "CMD64_" (param ${escapePath(profileLogTagParam)}) "_END_${sessionSuffix}")`,
+      )
+  }
 
   // Generate proxy environment variables using shared utility
   const proxyEnvArgs = generateProxyEnvVars(

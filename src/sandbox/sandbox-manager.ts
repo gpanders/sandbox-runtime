@@ -1924,6 +1924,14 @@ export type WrapWithSandboxOptions = {
    * reported as the violation's `command`. Defaults to `command`.
    */
   commandText?: string
+  /**
+   * macOS only: return the sandbox profile instead of a wrapped command, so
+   * that one profile serves many invocations. Its violations are attributed
+   * to the key in the `sandbox-exec -D` parameter of this name. The value is
+   * the standard base64 of the first 100 characters of the key, as the
+   * proxy username carries it.
+   */
+  profileLogTagParam?: string
 }
 
 /** A wrap that has started over this many times walks without giving the
@@ -2170,6 +2178,10 @@ async function wrapWithSandboxAgain(
   // walk and this check, and the wrap then starts over once more.
   if (movedOn()) return startOver()
 
+  if (options?.profileLogTagParam !== undefined && platform !== 'macos') {
+    throw new Error('profileLogTagParam is supported on macOS only')
+  }
+
   // Check custom config to allow pseudo-terminal (can be applied dynamically)
   const allowPty = customConfig?.allowPty ?? config?.allowPty
 
@@ -2215,6 +2227,9 @@ async function wrapWithSandboxAgain(
           customConfig?.allowAppleEvents ?? getAllowAppleEvents(),
         allowSysctlRead:
           customConfig?.allowSysctlRead ?? config?.allowSysctlRead,
+        allowUnsandboxedExec:
+          customConfig?.allowUnsandboxedExec ?? config?.allowUnsandboxedExec,
+        profileLogTagParam: options?.profileLogTagParam,
         binShell,
       })
 

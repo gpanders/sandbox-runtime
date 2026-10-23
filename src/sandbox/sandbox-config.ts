@@ -1196,6 +1196,22 @@ export const SandboxRuntimeConfigSchema = z
       )
       .optional()
       .describe('Additional exact sysctl names to allow reading (macOS only)'),
+    allowUnsandboxedExec: z
+      .array(
+        z
+          .string()
+          .refine(
+            path => path.startsWith('/'),
+            'Expected an absolute path',
+          ),
+      )
+      .optional()
+      .describe(
+        'Directories whose executables start outside the sandbox (macOS only). ' +
+          'Use this for trusted launchers that apply their own sandbox. ' +
+          'Deny writes to these directories, or a sandboxed process can place any program there. ' +
+          'Scripts are not affected: the rule applies to the executable image, not its interpreter.',
+      ),
     ripgrep: RipgrepConfigSchema.optional().describe(
       'Custom ripgrep configuration (default: { command: "rg" })',
     ),
